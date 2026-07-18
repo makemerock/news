@@ -40,7 +40,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    f"gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}"
 )
 
 
@@ -124,10 +124,20 @@ def rewrite_article(title: str, text: str) -> str:
     )
 
     body = {"contents": [{"parts": [{"text": prompt}]}]}
-    resp = requests.post(GEMINI_URL, json=body, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        resp = requests.post(GEMINI_URL, json=body, timeout=30)
+        if resp.status_code == 429:
+            wait = 20 * (attempt + 1)  # 20с, 40с, 60с
+            print(f"Лимит запросов Gemini (429), жду {wait} секунд и пробую снова...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    raise RuntimeError("Gemini: превышен лимит запросов после нескольких попыток")
 
 
 # ---------- ГЕНЕРАЦИЯ КАРТИНКИ ----------
