@@ -34,4 +34,5 @@ jobs:
           git config user.email "actions@github.com"
           git add posted.db
           git diff --staged --quiet || git commit -m "update posted.db [skip ci]"
+          git pull --rebase origin main
           git push
