@@ -22,11 +22,20 @@ from bs4 import BeautifulSoup
 
 # ---------- НАСТРОЙКИ ----------
 
-# Список RSS-источников. Просто добавляй новые строки, код менять не нужно.
+# RSS-источники (могут пересыхать со временем — держим как дополнительные)
 SOURCES = [
-    "https://www.rmnt.ru/rss/news.xml",
     "http://pro-remont.com/feed.rss",
     "http://www.obstanovka.com/feed/",
+]
+
+# Публичные Telegram-каналы по теме — читаем через их веб-версию (t.me/s/...), без токенов.
+# Проверенный и активный: DOMEO (@domeoru) — дизайн/ремонт/недвижимость, 537K подписчиков, постит ежедневно.
+# Добавляй новые каналы сюда просто по имени (без @ и без t.me/) — код менять не нужно.
+TELEGRAM_SOURCE_CHANNELS = [
+    "domeoru",
+    "decor_journal",
+    "mykvrt"
+    
 ]
 
 # Сколько новых постов публиковать за один запуск скрипта (чтобы не спамить разом)
@@ -40,8 +49,11 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}"
+    f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 )
+
+# Не постить статьи старше этого количества дней (фильтр от "мёртвых"/архивных RSS)
+MAX_ARTICLE_AGE_DAYS = 30
 
 
 # ---------- БАЗА ДАННЫХ ----------
@@ -72,9 +84,53 @@ def mark_posted(conn, link: str):
 
 # ---------- СБОР СТАТЕЙ ----------
 
+def fetch_telegram_channel_posts(channel: str):
+    """Читает последние посты публичного Telegram-канала через его веб-версию (без токенов и авторизации)."""
+    url = f"https://t.me/s/{channel}"
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Не удалось прочитать канал {channel}: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    posts = []
+    for msg_div in soup.find_all("div", class_="tgme_widget_message", attrs={"data-post": True}):
+        post_id = msg_div["data-post"]  # например "domeoru/11104"
+        link = f"https://t.me/{post_id}"
+
+        text_div = msg_div.find("div", class_="tgme_widget_message_text")
+        if not text_div:
+            continue  # пост без текста (только фото/видео) — пропускаем
+        text = text_div.get_text("\n", strip=True)
+        if len(text) < 60:
+            continue  # слишком короткий пост, не тянет на статью
+
+        time_tag = msg_div.find("time")
+        published_ts = None
+        if time_tag and time_tag.get("datetime"):
+            try:
+                from datetime import datetime
+                published_ts = datetime.fromisoformat(time_tag["datetime"]).timestamp()
+            except Exception:
+                pass
+
+        title = text.split("\n")[0][:80]  # первая строка поста как заголовок
+        posts.append(
+            {"title": title, "link": link, "summary": text, "published_ts": published_ts}
+        )
+
+    return posts
+
+
 def fetch_new_articles(conn):
-    """Проходит по всем источникам, возвращает список новых статей (title, link, summary)."""
+    """Собирает новые и свежие статьи из RSS-источников и Telegram-каналов."""
+    import calendar
+
     new_articles = []
+    cutoff = time.time() - MAX_ARTICLE_AGE_DAYS * 86400
+
     for feed_url in SOURCES:
         try:
             feed = feedparser.parse(feed_url)
@@ -82,13 +138,37 @@ def fetch_new_articles(conn):
             print(f"Не удалось прочитать {feed_url}: {e}")
             continue
 
+        fresh_in_this_feed = 0
         for entry in feed.entries:
             link = entry.get("link")
             title = entry.get("title", "")
             if not link or already_posted(conn, link):
                 continue
+
+            published_struct = entry.get("published_parsed") or entry.get("updated_parsed")
+            if published_struct:
+                published_ts = calendar.timegm(published_struct)
+                if published_ts < cutoff:
+                    continue
+            fresh_in_this_feed += 1
+
             summary = entry.get("summary", "") or entry.get("description", "")
             new_articles.append({"title": title, "link": link, "summary": summary})
+
+        print(f"{feed_url}: свежих новых статей — {fresh_in_this_feed}")
+
+    for channel in TELEGRAM_SOURCE_CHANNELS:
+        posts = fetch_telegram_channel_posts(channel)
+        fresh_in_this_channel = 0
+        for post in posts:
+            if already_posted(conn, post["link"]):
+                continue
+            if post["published_ts"] and post["published_ts"] < cutoff:
+                continue
+            fresh_in_this_channel += 1
+            new_articles.append(post)
+
+        print(f"Telegram @{channel}: свежих новых постов — {fresh_in_this_channel}")
 
     return new_articles
 
@@ -175,7 +255,10 @@ def main():
             break
 
         try:
-            full_text = fetch_full_text(article["link"], article["summary"])
+            if article["link"].startswith("https://t.me/"):
+                full_text = article["summary"]  # текст поста уже полный, доп. запрос не нужен
+            else:
+                full_text = fetch_full_text(article["link"], article["summary"])
             rewritten = rewrite_article(article["title"], full_text)
             image_bytes = generate_image(article["title"])
             post_to_telegram(rewritten, image_bytes)
