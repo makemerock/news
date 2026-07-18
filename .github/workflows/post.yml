@@ -1,0 +1,37 @@
+name: Автопостинг в канал
+
+on:
+  schedule:
+    # каждые 4 часа (время UTC)
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}  # позволяет запустить вручную кнопкой на GitHub
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Установка Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt
+
+      - name: Запуск бота
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python bot.py
+
+      - name: Сохранить базу постов обратно в репозиторий
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add posted.db
+          git diff --staged --quiet || git commit -m "update posted.db [skip ci]"
+          git push
