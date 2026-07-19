@@ -35,8 +35,9 @@ TELEGRAM_SOURCE_CHANNELS = [
     "domeoru",
 ]
 
-# Сколько новых постов публиковать за один запуск скрипта (чтобы не спамить разом)
-MAX_POSTS_PER_RUN = 3
+# Сколько новых постов публиковать за один запуск скрипта.
+# При 1 посте за запуск + расписании из 3 запусков в день (см. post.yml) — 3 поста в день, вразброс по времени.
+MAX_POSTS_PER_RUN = 1
 
 DB_PATH = "posted.db"
 
@@ -207,6 +208,7 @@ def rewrite_article(title: str, text: str) -> str:
     body = {
         "model": GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 700,  # с запасом на пост из 5-8 предложений + хэштеги, чтобы не обрезался
     }
 
     max_retries = 3
@@ -228,9 +230,12 @@ def rewrite_article(title: str, text: str) -> str:
 
 def generate_image(title: str) -> bytes:
     """Pollinations.ai — бесплатная генерация картинки по промпту, без API-ключа."""
+    import random
+
     prompt = f"cozy interior design photo, {title}, realistic, high quality, warm lighting"
     encoded = urllib.parse.quote(prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=768&nologo=true"
+    seed = random.randint(1, 1_000_000)  # без seed Pollinations может отдавать закэшированную картинку
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=768&nologo=true&seed={seed}"
     resp = requests.get(url, timeout=60)
     resp.raise_for_status()
     return resp.content
