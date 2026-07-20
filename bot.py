@@ -2,14 +2,17 @@
 Бот для Telegram-канала о ремонте/стройке/даче/дизайне.
 
 Что делает при каждом запуске:
-1. Проходит по списку RSS-источников (SOURCES ниже).
-2. Находит статьи, которых ещё не было (проверка по SQLite).
-3. Берёт текст статьи, делает рерайт через бесплатный Gemini API.
+1. Проверяет RSS-источники и публичные Telegram-каналы (см. SOURCES / TELEGRAM_SOURCE_CHANNELS)
+   на новые и свежие материалы.
+2. Если из источников набралось меньше постов, чем нужно на этот запуск (MAX_POSTS_PER_RUN) —
+   добирает недостающее полностью оригинальными постами, которые генерирует сам на одну
+   из тем ORIGINAL_TOPICS, избегая повторения недавних заголовков.
+3. Для каждого поста делает рерайт/генерацию текста через бесплатный Groq API.
 4. Генерирует тематическую картинку через Pollinations.ai (бесплатно, без ключа).
 5. Публикует пост (картинка + текст) в Telegram-канал.
-6. Запоминает статью в базе, чтобы не постить повторно.
+6. Запоминает пост в базе (ссылку и заголовок), чтобы не повторяться.
 
-Всё бесплатно: Gemini API (free tier), Pollinations.ai (free), GitHub Actions (cron).
+Всё бесплатно: Groq API (free tier), Pollinations.ai (free), GitHub Actions (cron).
 """
 
 import os
@@ -33,6 +36,15 @@ SOURCES = [
 # Добавляй новые каналы сюда просто по имени (без @ и без t.me/) — код менять не нужно.
 TELEGRAM_SOURCE_CHANNELS = [
     "domeoru",
+]
+
+# Темы для самостоятельной генерации постов — используются, когда из источников
+# набралось меньше постов, чем нужно на этот запуск (см. MAX_POSTS_PER_RUN).
+ORIGINAL_TOPICS = [
+    "ремонт квартиры (стены, полы, потолки, электрика, сантехника)",
+    "строительство и обустройство частного дома",
+    "дача и сад (грядки, теплицы, ландшафт, хозпостройки)",
+    "дизайн интерьера (стили, цвета, мебель, освещение, декор)",
 ]
 
 # Сколько новых постов публиковать за один запуск скрипта.
@@ -59,9 +71,14 @@ def init_db():
     conn.execute(
         """CREATE TABLE IF NOT EXISTS posted (
                link TEXT PRIMARY KEY,
+               title TEXT,
                posted_at INTEGER
            )"""
     )
+    # На случай, если база создана раньше без колонки title
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(posted)")]
+    if "title" not in cols:
+        conn.execute("ALTER TABLE posted ADD COLUMN title TEXT")
     conn.commit()
     return conn
 
@@ -71,11 +88,19 @@ def already_posted(conn, link: str) -> bool:
     return row is not None
 
 
-def mark_posted(conn, link: str):
+def mark_posted(conn, link: str, title: str = ""):
     conn.execute(
-        "INSERT INTO posted (link, posted_at) VALUES (?, ?)", (link, int(time.time()))
+        "INSERT INTO posted (link, title, posted_at) VALUES (?, ?, ?)",
+        (link, title, int(time.time())),
     )
     conn.commit()
+
+
+def get_recent_titles(conn, limit: int = 15):
+    rows = conn.execute(
+        "SELECT title FROM posted WHERE title != '' ORDER BY posted_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 # ---------- СБОР СТАТЕЙ ----------
@@ -241,6 +266,58 @@ def generate_image(title: str) -> bytes:
     return resp.content
 
 
+def generate_original_post(recent_titles):
+    """Генерирует полностью оригинальный пост на одну из тем ORIGINAL_TOPICS,
+    стараясь не повторять недавние заголовки."""
+    import random
+
+    topic = random.choice(ORIGINAL_TOPICS)
+    avoid_block = ""
+    if recent_titles:
+        avoid_list = "\n".join(f"- {t}" for t in recent_titles)
+        avoid_block = (
+            "\n\nВАЖНО: не повторяй эти уже опубликованные темы/заголовки, "
+            f"придумай что-то другое:\n{avoid_list}"
+        )
+
+    prompt = (
+        "Ты редактор Telegram-канала про ремонт, строительство, дачи и дизайн интерьера. "
+        f"Напиши один полезный, практичный пост на тему: {topic}. "
+        "Это может быть подборка советов, разбор частой ошибки, сравнение материалов/решений, "
+        "лайфхак или чек-лист — что-то конкретное и применимое на практике, не общие слова. "
+        "Пиши живо и понятно, без канцелярита. "
+        "Формат: 1) короткий цепляющий заголовок с эмодзи, 2) текст поста 5-8 предложений, "
+        "3) в конце 3-5 хэштегов по теме."
+        f"{avoid_block}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 700,
+    }
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=30)
+        if resp.status_code == 429:
+            wait = 20 * (attempt + 1)
+            print(f"Лимит запросов Groq (429), жду {wait} секунд и пробую снова...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        generated_text = data["choices"][0]["message"]["content"].strip()
+        title_for_image = generated_text.split("\n")[0][:80]
+        return title_for_image, generated_text
+
+    raise RuntimeError("Groq: превышен лимит запросов после нескольких попыток")
+
+
 # ---------- ПУБЛИКАЦИЯ В TELEGRAM ----------
 
 def post_to_telegram(caption: str, image_bytes: bytes):
@@ -271,13 +348,30 @@ def main():
             rewritten = rewrite_article(article["title"], full_text)
             image_bytes = generate_image(article["title"])
             post_to_telegram(rewritten, image_bytes)
-            mark_posted(conn, article["link"])
+            mark_posted(conn, article["link"], article["title"])
             posted_count += 1
-            print(f"Опубликовано: {article['title']}")
+            print(f"Опубликовано (источник): {article['title']}")
             time.sleep(5)  # небольшая пауза между постами
         except Exception as e:
             print(f"Ошибка при обработке '{article['title']}': {e}")
             continue
+
+    # Если из источников набралось меньше постов, чем нужно на этот запуск —
+    # добираем недостающее полностью сгенерированным контентом.
+    while posted_count < MAX_POSTS_PER_RUN:
+        try:
+            recent_titles = get_recent_titles(conn)
+            title, generated_text = generate_original_post(recent_titles)
+            image_bytes = generate_image(title)
+            post_to_telegram(generated_text, image_bytes)
+            synthetic_link = f"generated:{int(time.time())}-{posted_count}"
+            mark_posted(conn, synthetic_link, title)
+            posted_count += 1
+            print(f"Опубликовано (сгенерировано): {title}")
+            time.sleep(5)
+        except Exception as e:
+            print(f"Ошибка при генерации оригинального поста: {e}")
+            break
 
     conn.close()
     print(f"Готово. Опубликовано постов: {posted_count}")
