@@ -56,6 +56,9 @@ ORIGINAL_TOPICS = [
     "растения и озеленение дома и участка",
     "сезонная подготовка дома/дачи (к зиме, к лету, к дождям)",
     "маленький ремонт своими руками за один вечер (DIY без мастера)",
+    "ржачные (но обобщённые, без реальных имён) истории про ремонт и стройку — самые нелепые ошибки, решения и косяки, которые бывают у всех",
+    "мемные ситуации из жизни ремонта — 'вы точно это видели' — узнаваемые бытовые сценки с юмором",
+    "странные и дикие тренды в дизайне интерьера, над которыми грех не поугорать",
 ]
 
 # Единый голос канала — подключается во все промпты (и рерайт чужих постов, и генерация своих).
@@ -255,7 +258,7 @@ def rewrite_article(title: str, text: str) -> str:
     body = {
         "model": GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 700,  # с запасом на пост из 5-8 предложений + хэштеги, чтобы не обрезался
+        "max_tokens": 900,  # с запасом на пост из 5-8 предложений + хэштеги, чтобы не обрезался
     }
 
     max_retries = 3
@@ -275,11 +278,78 @@ def rewrite_article(title: str, text: str) -> str:
 
 # ---------- ГЕНЕРАЦИЯ КАРТИНКИ ----------
 
-def generate_image(title: str) -> bytes:
+def trim_to_complete_sentence(text: str) -> str:
+    """Если текст обрывается на полуслове — обрезает до последнего законченного предложения.
+    Хэштеги в конце (строки, начинающиеся с #) не трогает."""
+    import re
+
+    lines = text.rstrip().split("\n")
+
+    hashtag_start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("#"):
+            hashtag_start_idx = i
+            break
+
+    if hashtag_start_idx is not None:
+        body_lines = lines[:hashtag_start_idx]
+        tail_lines = lines[hashtag_start_idx:]
+    else:
+        body_lines = lines
+        tail_lines = []
+
+    body = "\n".join(body_lines).rstrip()
+
+    if body and body[-1] not in ".!?…»\"":
+        matches = list(re.finditer(r"[.!?…]", body))
+        if matches:
+            body = body[: matches[-1].end()]
+
+    result = body
+    if tail_lines:
+        result += "\n" + "\n".join(tail_lines)
+    return result.strip()
+
+
+def build_image_prompt(title: str, post_text: str) -> str:
+    """Просит Groq придумать конкретный, предметный промпт для картинки на основе
+    реального содержания поста — вместо одного и того же общего шаблона."""
+    prompt = (
+        "Ты подбираешь промпт для генерации фотореалистичной картинки к посту Telegram-канала "
+        "про ремонт/стройку/дачу/дизайн интерьера. Прочитай пост ниже и опиши ОДНУ конкретную, "
+        "предметную визуальную сцену, которая реально отражает его содержание — например, "
+        "конкретный материал, инструмент, элемент интерьера, участок дачи или этап работ, "
+        "а не общие слова вроде 'cozy interior' или 'beautiful house'. "
+        "Ответь ТОЛЬКО готовым промптом на английском языке для генерации изображения, "
+        "1-2 предложения, в стиле реалистичной фотографии, без крупных планов лиц людей.\n\n"
+        f"Заголовок: {title}\n\nТекст поста:\n{post_text[:1200]}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 150,
+    }
+
+    try:
+        resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"Не удалось сгенерировать промпт для картинки, использую заголовок: {e}")
+        return f"realistic photo related to: {title}"
+
+
+def generate_image(image_prompt: str) -> bytes:
     """Pollinations.ai — бесплатная генерация картинки по промпту, без API-ключа."""
     import random
 
-    prompt = f"cozy interior design photo, {title}, realistic, high quality, warm lighting"
+    prompt = f"{image_prompt}, photorealistic, high quality, natural lighting"
     encoded = urllib.parse.quote(prompt)
     seed = random.randint(1, 1_000_000)  # без seed Pollinations может отдавать закэшированную картинку
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=768&nologo=true&seed={seed}"
@@ -320,7 +390,7 @@ def generate_original_post(recent_titles):
     body = {
         "model": GROQ_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 700,
+        "max_tokens": 900,
     }
 
     max_retries = 3
@@ -367,8 +437,8 @@ def main():
                 full_text = article["summary"]  # текст поста уже полный, доп. запрос не нужен
             else:
                 full_text = fetch_full_text(article["link"], article["summary"])
-            rewritten = rewrite_article(article["title"], full_text)
-            image_bytes = generate_image(article["title"])
+            rewritten = trim_to_complete_sentence(rewrite_article(article["title"], full_text))
+            image_bytes = generate_image(build_image_prompt(article["title"], rewritten))
             post_to_telegram(rewritten, image_bytes)
             mark_posted(conn, article["link"], article["title"])
             posted_count += 1
@@ -384,7 +454,8 @@ def main():
         try:
             recent_titles = get_recent_titles(conn)
             title, generated_text = generate_original_post(recent_titles)
-            image_bytes = generate_image(title)
+            generated_text = trim_to_complete_sentence(generated_text)
+            image_bytes = generate_image(build_image_prompt(title, generated_text))
             post_to_telegram(generated_text, image_bytes)
             synthetic_link = f"generated:{int(time.time())}-{posted_count}"
             mark_posted(conn, synthetic_link, title)
