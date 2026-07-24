@@ -69,7 +69,13 @@ TONE_OF_VOICE = (
     "Пиши максимально живым человеческим языком: короткие фразы, разговорные обороты, "
     "уместная шутка или сравнение из жизни. Никакого канцелярита, никаких \"данный\", "
     "\"вышеуказанный\", никаких длинных вводных конструкций и штампов из рекламных буклетов. "
-    "Текст должен читаться так, будто его написал живой человек с чувством юмора, а не бот."
+    "Текст должен читаться так, будто его написал живой человек с чувством юмора, а не бот. "
+    "ЗАПРЕЩЕНО использовать markdown-разметку: никаких звёздочек **жирный текст**, "
+    "никаких * в начале строк для списков, никаких решёток для заголовков. "
+    "Пиши обычным текстом, для списков используй эмодзи или тире в начале строки. "
+    "ЗАПРЕЩЕНЫ штампы, которые выдают ИИ-текст: 'давайте рассмотрим', 'итак', 'в заключение', "
+    "'давайте признаем', 'не секрет, что', 'друзья', 'подведём итог' — начинай и заканчивай "
+    "пост естественно, как будто пишешь другу, а не составляешь отчёт."
 )
 
 # Сколько новых постов публиковать за один запуск скрипта.
@@ -278,6 +284,18 @@ def rewrite_article(title: str, text: str) -> str:
 
 # ---------- ГЕНЕРАЦИЯ КАРТИНКИ ----------
 
+def strip_stray_markdown(text: str) -> str:
+    """Страховка на случай, если модель всё же вставит markdown — Telegram его не рендерит
+    в подписи к фото, так что звёздочки нужно убрать программно."""
+    import re
+
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)  # **жирный** -> жирный
+    text = re.sub(r"(?m)^\*\s+", "— ", text)  # "* пункт списка" -> "— пункт списка"
+    text = text.replace("**", "").replace("*", "")  # добиваем одиночные звёздочки
+    text = re.sub(r"(?m)^#{1,6}\s*", "", text)  # markdown-заголовки, если проскочат
+    return text
+
+
 def trim_to_complete_sentence(text: str) -> str:
     """Если текст обрывается на полуслове — обрезает до последнего законченного предложения.
     Хэштеги в конце (строки, начинающиеся с #) не трогает."""
@@ -413,9 +431,12 @@ def generate_original_post(recent_titles):
 # ---------- ПУБЛИКАЦИЯ В TELEGRAM ----------
 
 def post_to_telegram(caption: str, image_bytes: bytes):
+    if len(caption) > 1024:  # лимит Telegram на подпись к фото
+        caption = trim_to_complete_sentence(caption[:1024])
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     files = {"photo": ("image.jpg", image_bytes)}
-    data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption[:1024]}  # Telegram лимит подписи
+    data = {"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption}
     resp = requests.post(url, data=data, files=files, timeout=30)
     resp.raise_for_status()
 
@@ -437,7 +458,7 @@ def main():
                 full_text = article["summary"]  # текст поста уже полный, доп. запрос не нужен
             else:
                 full_text = fetch_full_text(article["link"], article["summary"])
-            rewritten = trim_to_complete_sentence(rewrite_article(article["title"], full_text))
+            rewritten = trim_to_complete_sentence(strip_stray_markdown(rewrite_article(article["title"], full_text)))
             image_bytes = generate_image(build_image_prompt(article["title"], rewritten))
             post_to_telegram(rewritten, image_bytes)
             mark_posted(conn, article["link"], article["title"])
@@ -454,7 +475,7 @@ def main():
         try:
             recent_titles = get_recent_titles(conn)
             title, generated_text = generate_original_post(recent_titles)
-            generated_text = trim_to_complete_sentence(generated_text)
+            generated_text = trim_to_complete_sentence(strip_stray_markdown(generated_text))
             image_bytes = generate_image(build_image_prompt(title, generated_text))
             post_to_telegram(generated_text, image_bytes)
             synthetic_link = f"generated:{int(time.time())}-{posted_count}"
