@@ -82,7 +82,25 @@ TONE_OF_VOICE = (
     "мгновенно понятна с первого прочтения, без второго объяснения; если сомневаешься, что "
     "метафора однозначно считается — не используй её вообще, лучше скажи прямо и конкретно. "
     "Никаких риторических вопросов подряд, никакой воды и общих рассуждений — только конкретика: "
-    "цифры, материалы, конкретные действия."
+    "цифры, материалы, конкретные действия. "
+    "НЕ ВЫДУМЫВАЙ конкретную статистику, проценты или суммы в рублях, которые нельзя проверить "
+    "(например 'в среднем тратим X рублей в год') — это может быть неправдой. Если хочешь привести "
+    "цифру, используй только общеизвестные, легко проверяемые вещи (например реальные цены на "
+    "стандартные материалы), либо вообще обойдись без цифр статистики. "
+    "ПИШИ ИСКЛЮЧИТЕЛЬНО НА РУССКОМ ЯЗЫКЕ. Ни одного слова латиницей или на другом языке — "
+    "даже техническому термину всегда есть русский аналог (например 'смеситель', а не 'mixer'; "
+    "'сложные', а не 'difíciles'). Если не уверен в русском слове — используй более простое и "
+    "распространённое русское слово вместо иностранного."
+)
+
+# Живой пример-эталон — показываем модели, а не только рассказываем, как надо писать.
+EXAMPLE_POST = (
+    "🔨 Сверлишь стену и попадаешь в трубу\n\n"
+    "Знакомая история, да? Радость от нового шкафа резко сменяется потопом и звонком "
+    "сантехнику в 11 вечера. Перед тем как дырявить стену — простучи её и поищи следы "
+    "старой разводки, а лучше сверься со схемой коммуникаций, если она сохранилась. "
+    "Пять минут проверки надёжнее, чем вера в удачу.\n\n"
+    "#ремонт #лайфхак #советы"
 )
 
 # Сколько новых постов публиковать за один запуск скрипта.
@@ -251,14 +269,30 @@ def fetch_full_text(url: str, fallback: str) -> str:
 
 # ---------- РЕРАЙТ ЧЕРЕЗ GROQ ----------
 
+def contains_foreign_script(text: str) -> bool:
+    """Проверяет, не затесались ли в текст иероглифы (китайский/японский/корейский) или
+    случайные латинские слова-глюки — модель иногда путает токены на разных языках."""
+    import re
+
+    if re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", text):
+        return True
+    if re.search(r"(?<![#\wа-яА-ЯёЁ])[a-zA-Z]{2,}(?![\wа-яА-ЯёЁ])", text):
+        return True
+    return False
+
+
 def rewrite_article(title: str, text: str) -> str:
-    prompt = (
+    system_prompt = (
         "Ты редактор Telegram-канала про ремонт, строительство, дачи и дизайн интерьера. "
+        f"{TONE_OF_VOICE}\n\n"
+        f"Вот пример поста в правильном тоне — ориентируйся на него по стилю, длине и юмору "
+        f"(тему бери свою, не копируй эту):\n\n{EXAMPLE_POST}"
+    )
+    user_prompt = (
         "Перепиши статью своими словами: сохрани полезные факты и советы, но полностью "
         "измени структуру предложений и формулировки, чтобы текст был уникальным. "
         "Игнорируй в исходном тексте рекламные вставки, ссылки на ботов/каналы, призывы "
         "поставить реакцию или подписаться — используй только содержательную часть про ремонт/дизайн. "
-        f"{TONE_OF_VOICE} "
         "Формат: 1) короткий цепляющий заголовок с эмодзи, 2) текст поста 3-5 коротких предложений, "
         "3) в конце 3-5 хэштегов по теме. Не упоминай исходный источник.\n\n"
         f"Заголовок статьи: {title}\n\nТекст статьи:\n{text}"
@@ -270,11 +304,16 @@ def rewrite_article(title: str, text: str) -> str:
     }
     body = {
         "model": GROQ_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
         "max_tokens": 500,  # пост теперь короче (3-5 предложений), не нужен такой большой запас
+        "temperature": 0.95,  # повыше для живости и юмора, а не сухих формулировок
     }
 
     max_retries = 3
+    result_text = None
     for attempt in range(max_retries):
         resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=30)
         if resp.status_code == 429:
@@ -284,8 +323,15 @@ def rewrite_article(title: str, text: str) -> str:
             continue
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        candidate = data["choices"][0]["message"]["content"].strip()
+        if contains_foreign_script(candidate):
+            print("В тексте обнаружены иероглифы/иностранные слова, перегенерирую...")
+            result_text = candidate  # на случай, если все попытки будут с глюком — вернём последнюю
+            continue
+        return candidate
 
+    if result_text is not None:
+        return result_text  # не идеально, но лучше, чем упасть с ошибкой
     raise RuntimeError("Groq: превышен лимит запросов после нескольких попыток")
 
 
@@ -301,6 +347,37 @@ def strip_stray_markdown(text: str) -> str:
     text = text.replace("**", "").replace("*", "")  # добиваем одиночные звёздочки
     text = re.sub(r"(?m)^#{1,6}\s*", "", text)  # markdown-заголовки, если проскочат
     return text
+
+
+def enforce_post_length(text: str, max_sentences: int = 6) -> str:
+    """Страховка на уровне кода: даже если модель проигнорировала просьбу писать коротко,
+    обрезаем основной текст (не хэштеги) до max_sentences предложений."""
+    import re
+
+    lines = text.rstrip().split("\n")
+
+    hashtag_start_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("#"):
+            hashtag_start_idx = i
+            break
+
+    if hashtag_start_idx is not None:
+        body_lines = lines[:hashtag_start_idx]
+        tail_lines = lines[hashtag_start_idx:]
+    else:
+        body_lines = lines
+        tail_lines = []
+
+    body = "\n".join(body_lines).strip()
+    sentences = re.findall(r"[^.!?…]+[.!?…]+|\S+$", body)
+    if len(sentences) > max_sentences:
+        body = "".join(sentences[:max_sentences]).strip()
+
+    result = body
+    if tail_lines:
+        result += "\n" + "\n".join(tail_lines)
+    return result.strip()
 
 
 def trim_to_complete_sentence(text: str) -> str:
@@ -397,12 +474,19 @@ def generate_original_post(recent_titles):
             f"придумай что-то другое:\n{avoid_list}"
         )
 
-    prompt = (
+    system_prompt = (
         "Ты редактор Telegram-канала про ремонт, строительство, дачи и дизайн интерьера. "
+        f"{TONE_OF_VOICE}\n\n"
+        f"Вот пример поста в правильном тоне — ориентируйся на него по стилю, длине и юмору "
+        f"(тему бери свою, не копируй эту):\n\n{EXAMPLE_POST}"
+    )
+    user_prompt = (
         f"Напиши один полезный, практичный пост на тему: {topic}. "
         "Это может быть подборка советов, разбор частой ошибки, сравнение материалов/решений, "
-        "лайфхак или чек-лист — что-то конкретное и применимое на практике, не общие слова. "
-        f"{TONE_OF_VOICE} "
+        "лайфхак, чек-лист или короткая узнаваемая жизненная сценка — что-то конкретное и "
+        "применимое на практике, не общие слова. Разнообразь формат — не делай каждый раз "
+        "просто список 'проверь то, проверь это': иногда это может быть мини-история, "
+        "неожиданное наблюдение или смешное сравнение. "
         "Формат: 1) короткий цепляющий заголовок с эмодзи, 2) текст поста 3-5 коротких предложений, "
         "3) в конце 3-5 хэштегов по теме."
         f"{avoid_block}"
@@ -414,11 +498,16 @@ def generate_original_post(recent_titles):
     }
     body = {
         "model": GROQ_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
         "max_tokens": 500,  # пост теперь короче (3-5 предложений)
+        "temperature": 0.95,  # повыше для живости и юмора, а не сухих формулировок
     }
 
     max_retries = 3
+    fallback_result = None
     for attempt in range(max_retries):
         resp = requests.post(GROQ_URL, headers=headers, json=body, timeout=30)
         if resp.status_code == 429:
@@ -430,8 +519,14 @@ def generate_original_post(recent_titles):
         data = resp.json()
         generated_text = data["choices"][0]["message"]["content"].strip()
         title_for_image = generated_text.split("\n")[0][:80]
+        if contains_foreign_script(generated_text):
+            print("В тексте обнаружены иероглифы/иностранные слова, перегенерирую...")
+            fallback_result = (title_for_image, generated_text)
+            continue
         return title_for_image, generated_text
 
+    if fallback_result is not None:
+        return fallback_result  # не идеально, но лучше, чем упасть с ошибкой
     raise RuntimeError("Groq: превышен лимит запросов после нескольких попыток")
 
 
@@ -465,7 +560,7 @@ def main():
                 full_text = article["summary"]  # текст поста уже полный, доп. запрос не нужен
             else:
                 full_text = fetch_full_text(article["link"], article["summary"])
-            rewritten = trim_to_complete_sentence(strip_stray_markdown(rewrite_article(article["title"], full_text)))
+            rewritten = trim_to_complete_sentence(enforce_post_length(strip_stray_markdown(rewrite_article(article["title"], full_text))))
             image_bytes = generate_image(build_image_prompt(article["title"], rewritten))
             post_to_telegram(rewritten, image_bytes)
             mark_posted(conn, article["link"], article["title"])
@@ -482,7 +577,7 @@ def main():
         try:
             recent_titles = get_recent_titles(conn)
             title, generated_text = generate_original_post(recent_titles)
-            generated_text = trim_to_complete_sentence(strip_stray_markdown(generated_text))
+            generated_text = trim_to_complete_sentence(enforce_post_length(strip_stray_markdown(generated_text)))
             image_bytes = generate_image(build_image_prompt(title, generated_text))
             post_to_telegram(generated_text, image_bytes)
             synthetic_link = f"generated:{int(time.time())}-{posted_count}"
