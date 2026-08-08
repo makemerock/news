@@ -422,8 +422,13 @@ def build_image_prompt(title: str, post_text: str) -> str:
         "предметную визуальную сцену, которая реально отражает его содержание — например, "
         "конкретный материал, инструмент, элемент интерьера, участок дачи или этап работ, "
         "а не общие слова вроде 'cozy interior' или 'beautiful house'. "
+        "ВАЖНО: если в заголовке или тексте есть образные/переносные слова вроде 'мечта', "
+        "'сказка', 'рай', 'космос' и т.п. — это фигура речи, НЕ рисуй буквально фантастику, "
+        "сны, космос или сюрреализм. Изображай только реалистичную бытовую сцену: обычную "
+        "квартиру, комнату, инструмент или материал, как в жизни. "
         "Ответь ТОЛЬКО готовым промптом на английском языке для генерации изображения, "
-        "1-2 предложения, в стиле реалистичной фотографии, без крупных планов лиц людей.\n\n"
+        "1-2 предложения, в стиле реалистичной документальной фотографии интерьера/стройки, "
+        "без фантастики, без сюрреализма, без крупных планов лиц людей.\n\n"
         f"Заголовок: {title}\n\nТекст поста:\n{post_text[:1200]}"
     )
 
@@ -444,14 +449,14 @@ def build_image_prompt(title: str, post_text: str) -> str:
         return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print(f"Не удалось сгенерировать промпт для картинки, использую заголовок: {e}")
-        return f"realistic photo related to: {title}"
+        return "realistic documentary photo of a modern home renovation or interior, no fantasy, no surreal elements"
 
 
 def generate_image(image_prompt: str) -> bytes:
     """Pollinations.ai — бесплатная генерация картинки по промпту, без API-ключа."""
     import random
 
-    prompt = f"{image_prompt}, photorealistic, high quality, natural lighting"
+    prompt = f"{image_prompt}, photorealistic, high quality, natural lighting, no fantasy, no surreal, no dreamlike style"
     encoded = urllib.parse.quote(prompt)
     seed = random.randint(1, 1_000_000)  # без seed Pollinations может отдавать закэшированную картинку
     url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=768&nologo=true&seed={seed}"
